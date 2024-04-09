@@ -1,0 +1,92 @@
+pipeline {
+
+  agent any
+
+  parameters {
+    // choice name: 'operation', choices: "deployment\nconfiguration-update", description: 'operation (No need to put branch in configuration-update)'
+    string name: 'ticket', defaultValue: ''
+  }
+
+  stages {
+
+    stage('Checkout') {
+      steps {
+        checkout([$class: 'GitSCM', branches: [[name: "production"]], doGenerateSubmoduleConfigurations: false, extensions: [], submoduleCfg: [], userRemoteConfigs: [[credentialsId: 'devops-prod-jenkins-key', url: 'git@bitbucket.org:liciousadmin/nextjs-web.git']]])
+        script {
+            env.commit_id = "${sh(script:'git rev-parse --short HEAD', returnStdout: true).trim()}"
+            env.tag = "production-${env.commit_id}-${BUILD_NUMBER}"
+        }
+      }
+    }
+
+    stage('Prod Configuration Update') {
+      // when {
+      //   expression { params.operation == 'configuration-update' }
+      // }
+        steps {
+        sh 'ansible-playbook -i /opt/infra-devops-codebase/automation-with-ansible/ansible-inventory/prod_aws_ec2.yaml -u ubuntu -e "evn_name=prod app_name=nextjs-web bucket_name=licious-prod-configurations-secrets inv_tag=tag_nextjsweb file_name=.env file_path=/var/www/html/nextjs-web service_name=nextjs-web" /opt/infra-devops-codebase/automation-with-ansible/application-cd-with-ansible/config-management/config_pull_and_update_s3.yml'
+
+        sh 'ansible-playbook -i /opt/infra-devops-codebase/automation-with-ansible/ansible-inventory/prod_aws_ec2.yaml -u ubuntu -e "evn_name=prod app_name=nextjs-web bucket_name=licious-prod-configurations-secrets file_name=.env file_path=${WORKSPACE}" /opt/infra-devops-codebase/automation-with-ansible/application-cd-with-ansible/config-management/config_pull_and_update_s3_localhost.yml'
+        
+      }
+    }
+
+    stage('Docker build and ECR push') {
+      //  when {
+      //   expression { params.operation == 'deployment' }
+      // }
+      steps {
+        sh "docker build -t 028686181435.dkr.ecr.ap-south-1.amazonaws.com/nextjs-web:${env.tag} ."
+        sh "docker push 028686181435.dkr.ecr.ap-south-1.amazonaws.com/nextjs-web:${env.tag}"
+      }
+    }
+
+    stage("Prod Deployment") {
+      // when {
+      //   expression { params.operation == 'deployment' }
+      // }
+      steps {
+        wrap([$class: 'BuildUser']) {
+          sh "ansible-playbook -i /opt/infra-devops-codebase/automation-with-ansible/ansible-inventory/prod_aws_ec2.yaml -u ubuntu -e 'inv_tag=tag_nextjsweb serial_value=1 projectdir=/var/www/html/nextjs-web TAG=${env.tag} branch=production' /opt/infra-devops-codebase/automation-with-ansible/application-cd-with-ansible/deploy/php/main-nextjs.yaml"
+
+          sh "git rev-parse --short HEAD > .git/commit-id"
+          sh "/opt/infra-devops-codebase/automation-with-ansible/application-cd-with-ansible/deploy/recordit.sh `cat .git/commit-id` ${BUILD_USER_EMAIL} ${env.JOB_NAME} ${params.ticket}"
+        }
+      }
+    }
+  }
+
+post {
+        always {
+            script {
+                slackSend(
+                    color: color_slack_msg(),
+                    message: """
+                        *${currentBuild.currentResult}* 
+                        Started By: `${env.BUILD_USER}`
+                        JobName: `${env.JOB_NAME}` Build No.: `${env.BUILD_DISPLAY_NAME}` 
+                        More info at: ${env.BUILD_URL}
+                        BuildTime: ${currentBuild.durationString.minus(' and counting')}
+                        """.stripIndent().trim()
+                )
+            }
+            cleanWs()
+        }
+    }
+
+}
+def color_slack_msg() {
+    switch(currentBuild.currentResult) {
+    case "SUCCESS":
+        return "good"
+        break
+    case "FAILURE":
+    case "UNSTABLE":
+        return "danger"
+        break
+    default:
+        return "warning"
+        break
+    }
+}
+
